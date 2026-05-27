@@ -10,8 +10,9 @@ from dotenv import load_dotenv
 load_dotenv()
 
 class GmailClient:
-    def __init__(self, service):
+    def __init__(self, service, account_name: str = "default"):
         self.service = service
+        self.account_name = account_name
     
     def list_messages(self, query='', max_results=10):
         """List messages matching query"""

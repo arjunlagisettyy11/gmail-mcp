@@ -1,148 +1,143 @@
 import os
+import json
 import requests
 from dotenv import load_dotenv
 from google.oauth2.credentials import Credentials
 from google.auth.transport.requests import Request
 from googleapiclient.discovery import build
-from typing import Dict, Any
+from typing import Dict, Any, Optional
 
 # Load environment variables from .env file
 load_dotenv()
 
-# Gmail API scope
-SCOPES = ['https://www.googleapis.com/auth/gmail.readonly']
+# Gmail API scopes (expanded for send + modify + read + label management)
+READONLY_SCOPE = "https://www.googleapis.com/auth/gmail.readonly"
+SEND_SCOPE     = "https://www.googleapis.com/auth/gmail.send"
+MODIFY_SCOPE   = "https://www.googleapis.com/auth/gmail.modify"
+
+SCOPES = [READONLY_SCOPE, SEND_SCOPE, MODIFY_SCOPE]
+
+# Nango config (from .env when Nango Cloud, or override per-account)
+NANGO_BASE_URL = os.environ.get("NANGO_BASE_URL", "https://api.nango.dev")
+NANGO_SECRET_KEY = os.environ.get("NANGO_SECRET_KEY")
 
 
-def get_connection_credentials(id: str, providerConfigKey: str) -> Dict[str, Any]:
-    """Get credentials from Nango"""
-    base_url = os.environ.get("NANGO_BASE_URL")
-    secret_key = os.environ.get("NANGO_SECRET_KEY")
-    
-    url = f"{base_url}/connection/{id}"
+def _get_nango_credentials(connection_id: str, provider_config_key: str) -> Dict[str, Any]:
+    """Fetch credentials from Nango for a specific connection."""
+    if not NANGO_SECRET_KEY:
+        raise ValueError("NANGO_SECRET_KEY not configured")
+
+    url = f"{NANGO_BASE_URL}/connection/{connection_id}"
     params = {
-        "provider_config_key": providerConfigKey,
+        "provider_config_key": provider_config_key,
         "refresh_token": "true",
     }
-    headers = {"Authorization": f"Bearer {secret_key}"}
-    
-    response = requests.get(url, headers=headers, params=params)
-    response.raise_for_status()  # Raise exception for bad status codes
-    
+    headers = {"Authorization": f"Bearer {NANGO_SECRET_KEY}"}
+
+    response = requests.get(url, headers=headers, params=params, timeout=30)
+    response.raise_for_status()
     return response.json()
 
-def create_credentials_from_nango(nango_response: Dict[str, Any]) -> Credentials:
-    """Create Google credentials object from Nango response"""
-    
-    # Extract token information from Nango response
-    # Adjust these keys based on your actual Nango response structure
-    credentials_data = nango_response.get('credentials', nango_response)
-    
-    # Common fields that might be in Nango response
-    access_token = credentials_data.get('access_token')
-    refresh_token = credentials_data.get('refresh_token')
-    token_uri = 'https://oauth2.googleapis.com/token'
-    client_id = credentials_data.get('client_id')
-    client_secret = credentials_data.get('client_secret')
-    
+
+def _extract_tokens(nango_response: Dict[str, Any]) -> Dict[str, Optional[str]]:
+    """Extract access_token / refresh_token from Nango response."""
+    access_token = None
+    refresh_token = None
+    client_id = None
+    client_secret = None
+
+    # Try multiple possible response shapes
+    if "credentials" in nango_response:
+        creds = nango_response["credentials"]
+        access_token  = creds.get("access_token")
+        refresh_token = creds.get("refresh_token")
+        client_id     = creds.get("client_id") or creds.get("oauth_client_id")
+        client_secret = creds.get("client_secret") or creds.get("oauth_client_secret")
+    else:
+        access_token  = nango_response.get("access_token")
+        refresh_token = nango_response.get("refresh_token")
+        client_id     = nango_response.get("client_id")
+        client_secret = nango_response.get("client_secret")
+
+    return {
+        "access_token":  access_token,
+        "refresh_token": refresh_token,
+        "client_id":     client_id,
+        "client_secret": client_secret,
+    }
+
+
+# Per-account service cache: account -> (service, credentials)
+_service_cache: Dict[str, Any] = {}
+
+
+def get_gmail_service(
+    connection_id: str,
+    provider_config_key: str = "google",
+    account: Optional[str] = None,
+) -> build:
+    """Authenticate Gmail via Nango and return a Gmail API service object.
+
+    Uses an in-memory cache per account alias to avoid re-authenticating
+    on every tool call.
+    """
+    global _service_cache
+
+    cache_key = f"{provider_config_key}:{connection_id}"
+    if account:
+        cache_key = f"{account}:{cache_key}"
+
+    # Check cache
+    cached = _service_cache.get(cache_key)
+    if cached:
+        service, creds = cached["service"], cached["creds"]
+        if creds.valid or (creds.expired and creds.refresh_token):
+            if creds.expired:
+                creds.refresh(Request())
+                _service_cache[cache_key]["creds"] = creds
+            return service
+        # Cache stale; drop and re-auth
+        del _service_cache[cache_key]
+
+    # Fetch from Nango
+    nango_resp = _get_nango_credentials(connection_id, provider_config_key)
+    tokens = _extract_tokens(nango_resp)
+
+    access_token = tokens["access_token"]
     if not access_token:
-        raise ValueError("No access_token found in Nango response")
-    
-    # Create OAuth2 credentials object
+        raise ValueError("No access_token in Nango response")
+
     creds = Credentials(
         token=access_token,
-        refresh_token=refresh_token,
-        token_uri=token_uri,
-        client_id=client_id,
-        client_secret=client_secret,
-        scopes=SCOPES
+        refresh_token=tokens["refresh_token"],
+        token_uri="https://oauth2.googleapis.com/token",
+        client_id=tokens["client_id"] or "",
+        client_secret=tokens["client_secret"] or "",
+        scopes=SCOPES,
     )
-    
-    return creds
 
-def authenticate_gmail_with_nango(connection_id: str, provider_config_key: str = "google") -> build:
-    """Authenticate Gmail using Nango and return Gmail service object"""
-    
-    try:
-        # Get credentials from Nango
-        print(f"Getting credentials for connection: {connection_id}")
-        nango_response = get_connection_credentials(connection_id, provider_config_key)
-        
-        # Create Google credentials from Nango response
-        creds = create_credentials_from_nango(nango_response)
-        
-        # Refresh token if needed
-        if not creds.valid and creds.refresh_token:
-            print("Refreshing access token...")
-            creds.refresh(Request())
-        
-        # Build the Gmail service
-        service = build('gmail', 'v1', credentials=creds)
-        print("Gmail API authenticated successfully with Nango!")
-        
-        return service
-        
-    except requests.exceptions.RequestException as e:
-        print(f"Error connecting to Nango: {e}")
-        raise
-    except Exception as e:
-        print(f"Error authenticating with Gmail: {e}")
-        raise
+    # Refresh if expired
+    if creds.expired and creds.refresh_token:
+        creds.refresh(Request())
 
-# Alternative version if Nango response structure is different
-def authenticate_gmail_with_nango_v2(connection_id: str, provider_config_key: str = "google") -> build:
-    """Alternative version - adjust based on your Nango response structure"""
-    
-    try:
-        # Get credentials from Nango
-        nango_response = get_connection_credentials(connection_id, provider_config_key)
-        
-        # Debug: Print response structure (remove in production)
-        print("Nango response structure:", list(nango_response.keys()))
-        
-        # Try different response structures
-        access_token = None
-        refresh_token = None
-        
-        # Check multiple possible locations for tokens
-        if 'access_token' in nango_response:
-            access_token = nango_response['access_token']
-            refresh_token = nango_response.get('refresh_token')
-        elif 'credentials' in nango_response:
-            creds_data = nango_response['credentials']
-            access_token = creds_data.get('access_token')
-            refresh_token = creds_data.get('refresh_token')
-        elif 'token' in nango_response:
-            access_token = nango_response['token']
-            refresh_token = nango_response.get('refresh_token')
-        
-        if not access_token:
-            raise ValueError(f"No access token found in Nango response. Available keys: {list(nango_response.keys())}")
-        
-        print(f"Found access token: {access_token[:20]}...")
-        
-        # Create OAuth2 credentials
-        creds = Credentials(
-            token=access_token,
-            refresh_token=refresh_token,
-            token_uri='https://oauth2.googleapis.com/token',
-            client_id=None,  # Not required for existing tokens
-            client_secret=None,  # Not required for existing tokens
-            scopes=SCOPES
-        )
-        
-        # Build the Gmail service
-        service = build('gmail', 'v1', credentials=creds)
-        print("Gmail API authenticated successfully with Nango!")
-        
-        return service
-        
-    except Exception as e:
-        print(f"Error in authentication: {e}")
-        print("Full Nango response for debugging:")
-        try:
-            nango_response = get_connection_credentials(connection_id, provider_config_key)
-            print(nango_response)
-        except:
-            print("Could not fetch Nango response for debugging")
-        raise
+    service = build("gmail", "v1", credentials=creds)
+    _service_cache[cache_key] = {"service": service, "creds": creds}
+    return service
+
+
+# Backward-compat convenience helpers
+def authenticate_gmail_with_nango(
+    connection_id: str,
+    provider_config_key: str = "google",
+) -> build:
+    """Legacy single-account entry point (kept for compat)."""
+    return get_gmail_service(connection_id, provider_config_key)
+
+
+def authenticate_gmail_with_nango_v2(
+    connection_id: str,
+    provider_config_key: str = "google",
+) -> build:
+    """Legacy single-account entry point v2 (kept for compat)."""
+    return get_gmail_service(connection_id, provider_config_key)
 
